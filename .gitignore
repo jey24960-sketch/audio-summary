@@ -13,12 +13,10 @@ build/
 venv/
 env/
 
-# Pipeline cache
+# Pipeline cache and outputs
 .cache/
-
-# Generated transcript / summary files
-*_transcript.txt
-summaries/
+outputs/
+uploads/
 
 # Jupyter
 .ipynb_checkpoints/

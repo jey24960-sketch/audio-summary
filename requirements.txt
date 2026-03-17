@@ -1,12 +1,23 @@
-# Core dependencies
-openai>=1.30.0
-pydub>=0.25.1
-requests>=2.31.0
-python-dotenv>=1.0.0
+# ---------------------------------------------------------------------------
+# audio-summary — Python dependencies
+# ---------------------------------------------------------------------------
+# System requirement: ffmpeg must be installed separately.
+#   Linux / Colab : apt-get install -y ffmpeg
+#   macOS         : brew install ffmpeg
+#   Streamlit Cloud: packages.txt (already included in this repo)
+# ---------------------------------------------------------------------------
 
-# Token counting for accurate chunking (avoids model context overflow)
+# OpenAI SDK — Whisper transcription + GPT-4o summarization
+openai>=1.30.0
+
+# HTTP client — Notion API calls
+requests>=2.31.0
+
+# Token counting — accurate chunk sizing for GPT-4o context window
 tiktoken>=0.7.0
 
-# ffmpeg Python bindings (pydub uses the system ffmpeg binary,
-# but this package installs a portable copy for cloud/Colab environments)
-ffmpeg-python>=0.2.0
+# Streamlit — web UI (also works fine as a library import in CLI mode)
+streamlit>=1.32.0
+
+# .env loading for local development (not needed on Streamlit Cloud)
+python-dotenv>=1.0.0
