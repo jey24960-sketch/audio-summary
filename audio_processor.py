@@ -1,32 +1,38 @@
 """
 audio_processor.py - ffmpeg-based audio chunking for the Whisper API.
 
-Replaces the previous pydub implementation entirely.  Uses only the
-system `ffmpeg` / `ffprobe` binaries via subprocess — no pydub, no
-audioop, no pyaudioop.
+Uses only the system `ffmpeg` / `ffprobe` binaries via subprocess —
+no pydub, no audioop, no pyaudioop.
 
-Chunking strategy
------------------
-* Audio duration is read with ffprobe.
-* The file is divided into fixed-length windows (default 10 minutes) with
-  a 30-second overlap so no speech is lost at chunk boundaries.
-* Each chunk is re-encoded as mono 16 kHz MP3 at 32 kbps — roughly
-  2.4 MB per 10-minute chunk, safely under Whisper's 25 MB hard limit.
-* Chunks are written to a TemporaryDirectory that is cleaned up when the
-  context manager exits.
-* `split_points()` returns the planned time windows WITHOUT extracting
-  anything, so `transcriber.py` can skip extraction for already-cached
-  chunks on a resumed run.
-* `extract_chunk()` extracts exactly one chunk on demand.
-* Chunk files are small enough that the caller can delete them
-  immediately after transcription to conserve disk space.
+Processing pipeline
+-------------------
+1. Preprocessing (once, on the full file)
+   The raw audio is passed through an ffmpeg filter chain:
+     afftdn      — FFT-based noise reduction; attenuates background hiss
+                   and low-level noise common in lecture recordings.
+     dynaudnorm  — Dynamic audio normalisation; evens out quiet/loud
+                   sections so Whisper sees consistent input levels.
+   Output: mono 16 kHz WAV (PCM, lossless) stored in the temp directory.
+
+2. Duration probing
+   ffprobe reads the duration from the preprocessed WAV.
+
+3. Chunking (on demand)
+   The preprocessed WAV is divided into fixed-length windows
+   (default 10 min, 30 s overlap).  Each window is extracted and
+   re-encoded as mono 16 kHz MP3 @ 32 kbps (≈ 2.4 MB per chunk,
+   safely under Whisper's 25 MB hard limit).
+
+4. Cleanup
+   The TemporaryDirectory (preprocessed WAV + all chunk files) is
+   deleted automatically when the context manager exits.
 
 Compatibility
 -------------
 Works on any system where `ffmpeg` and `ffprobe` are on PATH:
-  - Google Colab: apt-get install -y ffmpeg
-  - Streamlit Cloud: packages.txt → ffmpeg
-  - Linux / macOS dev machines: package-manager install
+  - Google Colab      : apt-get install -y ffmpeg
+  - Streamlit Cloud   : packages.txt → ffmpeg  (auto-installed)
+  - Linux / macOS     : package-manager install
 """
 
 import os
@@ -109,9 +115,10 @@ class AudioProcessor:
         if not self.audio_path.exists():
             raise FileNotFoundError(f"Audio file not found: {self.audio_path}")
 
-        self._tmpdir:      tempfile.TemporaryDirectory | None = None
-        self._tmpdir_path: Path  | None = None
-        self._duration_s:  float | None = None
+        self._tmpdir:       tempfile.TemporaryDirectory | None = None
+        self._tmpdir_path:  Path  | None = None
+        self._source_path:  Path  | None = None   # preprocessed WAV, used for chunking
+        self._duration_s:   float | None = None
 
     # ------------------------------------------------------------------
     # Context manager
@@ -121,12 +128,23 @@ class AudioProcessor:
         _require_ffmpeg()   # fail fast with a clear message if not installed
         self._tmpdir      = tempfile.TemporaryDirectory(prefix="audio_chunks_")
         self._tmpdir_path = Path(self._tmpdir.name)
-        self._duration_s  = _probe_duration(self.audio_path)
+
+        # Step 1: preprocess the full audio once (denoise + normalise).
+        # The result is a mono 16 kHz WAV in the temp dir; all chunk
+        # extractions run against this file, not the original.
+        self._source_path = self._tmpdir_path / "preprocessed.wav"
         logger.info(
-            "Audio loaded: '%s'  %.1f min  %.1f MB",
+            "Preprocessing '%s' (%.1f MB) — afftdn + dynaudnorm …",
             self.audio_path.name,
-            self._duration_s / 60,
             self.audio_path.stat().st_size / 1_048_576,
+        )
+        _ffmpeg_preprocess(self.audio_path, self._source_path)
+
+        # Step 2: probe duration from the preprocessed file.
+        self._duration_s = _probe_duration(self._source_path)
+        logger.info(
+            "Preprocessing done — %.1f min of audio ready for chunking.",
+            self._duration_s / 60,
         )
         return self
 
@@ -185,7 +203,8 @@ class AudioProcessor:
             "Extracting chunk %d [%.1fs – %.1fs, %.0fs] → %s",
             index, start_s, end_s, duration_s, chunk_path.name,
         )
-        _ffmpeg_extract(self.audio_path, start_s, duration_s, chunk_path)
+        # Extract from the preprocessed WAV, not the original file.
+        _ffmpeg_extract(self._source_path, start_s, duration_s, chunk_path)
         return AudioChunk(path=chunk_path, index=index, start_s=start_s, end_s=end_s)
 
     # ------------------------------------------------------------------
@@ -243,6 +262,56 @@ def _probe_duration(audio_path: Path) -> float:
         raise RuntimeError(
             f"ffprobe returned unexpected output for '{audio_path.name}': "
             f"'{exc}'"
+        ) from exc
+
+
+def _ffmpeg_preprocess(input_path: Path, output_path: Path) -> None:
+    """
+    Apply the enhancement filter chain to the full audio file and write
+    the result to *output_path* as mono 16 kHz WAV (PCM, lossless).
+
+    Filter chain
+    ------------
+    afftdn      : FFT-based noise reduction.  Reduces constant background
+                  noise (HVAC hum, mic hiss) that degrades Whisper accuracy
+                  on typical lecture recordings.
+    dynaudnorm  : Dynamic audio normalisation.  Brings quiet passages up
+                  and loud peaks down so Whisper receives consistent levels
+                  throughout — important for long recordings where the
+                  lecturer moves or changes speaking volume.
+
+    The WAV intermediate is lossless so chunk extraction does not
+    introduce a second lossy encode step.  It lives inside the
+    TemporaryDirectory and is deleted when the context manager exits.
+
+    Timeout is generous (10 min) to handle 2-hour source files on slow
+    cloud VMs without false-alarm failures.
+    """
+    cmd = [
+        "ffmpeg", "-y",
+        "-i",  str(input_path),
+        "-af", "afftdn,dynaudnorm",   # denoise then normalise
+        "-ac", "1",                   # mono
+        "-ar", "16000",               # 16 kHz — matches Whisper's native rate
+        "-vn",                        # strip any video stream
+        str(output_path),
+    ]
+    try:
+        subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=600,  # 10 min — ample for a 2-hour file on a slow VM
+        )
+    except subprocess.CalledProcessError as exc:
+        stderr_tail = exc.stderr[-600:] if exc.stderr else "(no stderr)"
+        raise RuntimeError(
+            f"ffmpeg preprocessing failed for '{input_path.name}':\n{stderr_tail}"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"ffmpeg preprocessing timed out (>600 s) for '{input_path.name}'."
         ) from exc
 
 
