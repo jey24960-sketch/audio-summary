@@ -1,4 +1,3 @@
-<<<<<<< claude/audio-transcription-pipeline-rDxAi
 """
 app.py - Streamlit one-click web UI for the audio lecture pipeline.
 
