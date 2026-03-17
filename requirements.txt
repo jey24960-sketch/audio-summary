@@ -1,0 +1,9 @@
+# Core dependencies
+openai>=1.30.0
+pydub>=0.25.1
+requests>=2.31.0
+python-dotenv>=1.0.0
+
+# ffmpeg Python bindings (pydub uses the system ffmpeg binary,
+# but this package installs a portable copy for cloud/Colab environments)
+ffmpeg-python>=0.2.0
