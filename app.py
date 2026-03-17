@@ -1,12 +1,19 @@
-import streamlit as st
 import os
 import subprocess
+import sys
 from pathlib import Path
+
+# 🔥 Streamlit Cloud 환경 문제 해결 (필수 패키지 강제 설치)
+required_packages = ["requests", "python-dotenv", "pydub", "tiktoken", "openai"]
+
+for pkg in required_packages:
+    subprocess.run([sys.executable, "-m", "pip", "install", pkg])
+
+import streamlit as st
 
 st.set_page_config(page_title="강의 자동 정리", page_icon="🎙️")
 
 st.title("🎙️ 강의 자동 정리 시스템")
-
 st.markdown("녹음 파일 업로드 → 버튼 클릭 → 노션 자동 정리")
 
 # 🔐 환경변수 체크
@@ -48,7 +55,7 @@ if uploaded_file:
             st.error("❌ 실행 중 오류 발생")
             st.text(result.stderr)
 
-# 📂 결과 확인
+# 📂 결과 파일 표시
 if Path("outputs").exists():
     st.markdown("---")
     st.subheader("📂 생성된 결과 파일")
