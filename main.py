@@ -1,6 +1,14 @@
 """
 main.py - Pipeline entry point.
 
+Upgrades over v1
+----------------
+* [5] Structured output tree: outputs/transcripts/, outputs/summaries/, outputs/logs/
+* [4] Cost tracking: reads duration + token usage from cache, logs to
+      outputs/logs/costs.json via CostTracker.
+* [7] Files already marked status=done are skipped automatically —
+      prevents re-processing in incremental / scheduled runs.
+
 Usage
 -----
     # Process all audio files in a folder
@@ -9,11 +17,11 @@ Usage
     # Process a single file
     python main.py --audio-dir ./lectures --file lecture01.m4a
 
-    # Skip Notion upload (useful for testing transcription + summarization)
+    # Skip Notion upload (useful for testing)
     python main.py --audio-dir ./lectures --skip-notion
 
-    # Resume a previously interrupted run
-    python main.py --audio-dir ./lectures --cache-dir .cache
+    # Custom output and cache directories
+    python main.py --audio-dir ./lectures --output-dir ./outputs --cache-dir .cache
 
 Environment variables (see .env.example)
 -----------------------------------------
@@ -33,10 +41,22 @@ from dotenv import load_dotenv
 from notion_uploader import NotionUploader
 from summarizer import Summarizer
 from transcriber import Transcriber
-from utils import ProgressStore, discover_audio_files, ensure_dir, get_logger
+from utils import CostTracker, ProgressStore, discover_audio_files, ensure_dir, get_logger
 
-load_dotenv()  # Load .env file if present (noop if not found)
+load_dotenv()
 logger = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Output directory layout  [upgrade #5]
+# ---------------------------------------------------------------------------
+
+def _make_output_dirs(output_dir: Path) -> tuple[Path, Path, Path]:
+    """Create and return (transcripts_dir, summaries_dir, logs_dir)."""
+    transcripts_dir = ensure_dir(output_dir / "transcripts")
+    summaries_dir   = ensure_dir(output_dir / "summaries")
+    logs_dir        = ensure_dir(output_dir / "logs")
+    return transcripts_dir, summaries_dir, logs_dir
 
 
 # ---------------------------------------------------------------------------
@@ -44,21 +64,32 @@ logger = get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 def process_file(
-    audio_path: Path,
-    store: ProgressStore,
-    uploader: NotionUploader | None,
+    audio_path:      Path,
+    store:           ProgressStore,
+    cost_tracker:    CostTracker,
+    transcripts_dir: Path,
+    summaries_dir:   Path,
+    uploader:        NotionUploader | None,
 ) -> bool:
     """
     Run the full pipeline for one audio file.
     Returns True on success, False on failure.
     """
     filename = audio_path.name
+    stem     = audio_path.stem
+
+    # [upgrade #7] Skip files that have already completed successfully
+    if store.get(filename, "status") == "done":
+        logger.info("Skipping '%s' — already completed.", filename)
+        return True
+
     logger.info("=" * 60)
     logger.info("Processing: %s", filename)
     logger.info("=" * 60)
 
     try:
         # ---- Transcription ------------------------------------------
+        logger.info("[Stage 1/3] Transcription …")
         transcriber = Transcriber(store)
         transcript  = transcriber.transcribe(audio_path)
 
@@ -68,30 +99,45 @@ def process_file(
             len(transcript.split()),
         )
 
-        # Persist the transcript as a plain-text file alongside the audio
-        transcript_path = audio_path.parent / (audio_path.stem + "_transcript.txt")
+        # Save transcript to outputs/transcripts/
+        transcript_path = transcripts_dir / f"{stem}_transcript.txt"
         transcript_path.write_text(transcript, encoding="utf-8")
         logger.info("Transcript saved → %s", transcript_path)
 
+        # Record transcription cost [upgrade #4]
+        duration = store.get(filename, "audio_duration_seconds") or 0
+        cost_tracker.record_transcription(filename, duration)
+
         # ---- Summarization ------------------------------------------
+        logger.info("[Stage 2/3] Summarization …")
         summarizer = Summarizer(store)
         result     = summarizer.summarize(filename, transcript)
         logger.info("Summary generated.")
 
-        # Persist summary as plain-text files for offline reference
-        summary_dir = ensure_dir(audio_path.parent / "summaries")
-        (summary_dir / f"{audio_path.stem}_overall.txt").write_text(
+        # Save summaries to outputs/summaries/
+        (summaries_dir / f"{stem}_overall.txt").write_text(
             result.overall_summary, encoding="utf-8"
         )
-        (summary_dir / f"{audio_path.stem}_concepts.txt").write_text(
+        (summaries_dir / f"{stem}_concepts.txt").write_text(
             result.key_concepts, encoding="utf-8"
         )
-        (summary_dir / f"{audio_path.stem}_detailed.txt").write_text(
+        (summaries_dir / f"{stem}_detailed.txt").write_text(
             result.detailed_notes, encoding="utf-8"
         )
-        logger.info("Summary files saved → %s/", summary_dir)
+        logger.info("Summary files saved → %s/", summaries_dir)
+
+        # Record summarization cost [upgrade #4]
+        usage = store.get(filename, "summarization_tokens") or {}
+        cost_tracker.record_summarization(
+            filename,
+            input_tokens  = usage.get("input",  0),
+            output_tokens = usage.get("output", 0),
+        )
+        cost_tracker.record_total(filename)
+        cost_tracker.save()
 
         # ---- Notion upload ------------------------------------------
+        logger.info("[Stage 3/3] Notion upload …")
         if uploader is not None:
             if store.has(filename, "notion_page_url"):
                 logger.info(
@@ -110,7 +156,7 @@ def process_file(
         return True
 
     except Exception as exc:  # noqa: BLE001
-        logger.error("✗ %s — failed: %s", filename, exc)
+        logger.error("✗ [%s] Stage failed: %s", filename, exc)
         logger.debug(traceback.format_exc())
         store.update(filename, "status", "failed")
         store.update(filename, "error", str(exc))
@@ -122,20 +168,23 @@ def process_file(
 # ---------------------------------------------------------------------------
 
 def run_pipeline(
-    audio_dir: Path,
-    cache_dir: Path,
+    audio_dir:  Path,
+    output_dir: Path,
+    cache_dir:  Path,
     skip_notion: bool,
     target_file: str | None,
 ) -> None:
-    store    = ProgressStore(cache_dir)
-    uploader = None if skip_notion else NotionUploader()
+    transcripts_dir, summaries_dir, logs_dir = _make_output_dirs(output_dir)
+
+    store        = ProgressStore(cache_dir)
+    cost_tracker = CostTracker(logs_dir / "costs.json")
+    uploader     = None if skip_notion else NotionUploader()
 
     # Collect files to process
     if target_file:
         audio_files = [audio_dir / target_file]
-        missing = [f for f in audio_files if not f.exists()]
-        if missing:
-            logger.error("File not found: %s", missing[0])
+        if not audio_files[0].exists():
+            logger.error("File not found: %s", audio_files[0])
             sys.exit(1)
     else:
         audio_files = discover_audio_files(audio_dir)
@@ -148,13 +197,23 @@ def run_pipeline(
 
     results: dict[str, bool] = {}
     for audio_path in audio_files:
-        success = process_file(audio_path, store, uploader)
+        success = process_file(
+            audio_path      = audio_path,
+            store           = store,
+            cost_tracker    = cost_tracker,
+            transcripts_dir = transcripts_dir,
+            summaries_dir   = summaries_dir,
+            uploader        = uploader,
+        )
         results[audio_path.name] = success
 
-    # Summary report
+    # Final summary
     passed = sum(1 for v in results.values() if v)
     failed = len(results) - passed
     logger.info("Pipeline complete: %d succeeded, %d failed.", passed, failed)
+    logger.info("Outputs saved to: %s/", output_dir)
+    logger.info("Cost log:         %s", logs_dir / "costs.json")
+
     if failed:
         logger.error("Failed files:")
         for name, ok in results.items():
@@ -186,6 +245,12 @@ def parse_args() -> argparse.Namespace:
         help="Process a single file inside --audio-dir instead of all files.",
     )
     parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("outputs"),
+        help="Root output directory (default: ./outputs).",
+    )
+    parser.add_argument(
         "--cache-dir",
         type=Path,
         default=Path(".cache"),
@@ -203,11 +268,13 @@ def main() -> None:
     args = parse_args()
 
     logger.info("Audio directory : %s", args.audio_dir)
+    logger.info("Output directory: %s", args.output_dir)
     logger.info("Cache directory : %s", args.cache_dir)
     logger.info("Notion upload   : %s", "disabled" if args.skip_notion else "enabled")
 
     run_pipeline(
         audio_dir   = args.audio_dir,
+        output_dir  = args.output_dir,
         cache_dir   = args.cache_dir,
         skip_notion = args.skip_notion,
         target_file = args.file,

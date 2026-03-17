@@ -1,20 +1,22 @@
 """
 notion_uploader.py - Upload summarised lecture notes to Notion.
 
-Page structure
---------------
-  Title  : <filename>  (<YYYY-MM-DD>)
-  ├─ Toggle "전체 요약"   → overall_summary content
-  ├─ Toggle "핵심 개념"   → key_concepts content
-  └─ Toggle "상세 내용"   → detailed_notes content
+Upgrades over v1
+----------------
+* [6] Two-phase upload: page is created with the first two toggles fully
+      populated, then chunk-level detail is appended to the "상세 내용"
+      toggle in batches — safely bypassing Notion's 100-block-per-request
+      limit for long lectures.
+* [6] "상세 내용" is broken into "Part 1 / Part 2 / …" sub-sections using
+      heading_3 blocks, one per transcript chunk.
+* [7] All Notion API calls wrapped with @retry.
 
-Notion block constraints
-------------------------
-* A single rich_text element may not exceed 2 000 characters.
-* We split content at ~1 800 characters, always breaking at a newline
-  boundary so we never cut mid-sentence.
-* Toggles are created as synced_block children so they render as collapsible
-  sections in the Notion UI.
+Page structure (unchanged externally)
+--------------------------------------
+  Title  : <filename>  (<YYYY-MM-DD>)
+  ├─ Toggle "📝 전체 요약"   → overall_summary
+  ├─ Toggle "📌 핵심 개념"   → key_concepts
+  └─ Toggle "📚 상세 내용"   → Part 1 … Part N  (appended post-creation)
 """
 
 import datetime
@@ -27,9 +29,10 @@ from utils import get_logger, read_env, retry
 
 logger = get_logger(__name__)
 
-NOTION_API_VERSION = "2022-06-28"
-NOTION_API_BASE    = "https://api.notion.com/v1"
-MAX_BLOCK_CHARS    = 1_800  # conservative limit per rich_text chunk
+NOTION_API_VERSION    = "2022-06-28"
+NOTION_API_BASE       = "https://api.notion.com/v1"
+MAX_BLOCK_CHARS       = 1_800   # conservative Notion rich_text limit
+MAX_BLOCKS_PER_BATCH  = 90      # stay under Notion's 100-block API limit
 
 
 class NotionUploader:
@@ -43,9 +46,9 @@ class NotionUploader:
     """
 
     def __init__(self):
-        self._token      = read_env("NOTION_TOKEN")
-        self._parent_id  = read_env("NOTION_PARENT_PAGE_ID")
-        self._session    = requests.Session()
+        self._token     = read_env("NOTION_TOKEN")
+        self._parent_id = read_env("NOTION_PARENT_PAGE_ID")
+        self._session   = requests.Session()
         self._session.headers.update({
             "Authorization":  f"Bearer {self._token}",
             "Notion-Version": NOTION_API_VERSION,
@@ -58,20 +61,47 @@ class NotionUploader:
 
     def upload(self, audio_filename: str, result: SummaryResult) -> str:
         """
-        Create a new page under the parent page and return its URL.
+        Two-phase upload:
+          Phase 1 — Create the page with 전체 요약 + 핵심 개념 populated
+                    and an empty 상세 내용 toggle shell.
+          Phase 2 — Fetch the 상세 내용 block ID, then append Part N
+                    sub-sections in batches of MAX_BLOCKS_PER_BATCH.
         """
-        title    = self._make_title(audio_filename)
-        children = self._build_children(result)
-
+        title = self._make_title(audio_filename)
         logger.info("Creating Notion page: '%s' …", title)
-        page = self._create_page(title, children)
 
-        url = page.get("url", "<no url>")
-        logger.info("Notion page created: %s", url)
+        # Phase 1: create page skeleton
+        top_children = [
+            self._toggle_block("📝 전체 요약", result.overall_summary),
+            self._toggle_block("📌 핵심 개념", result.key_concepts),
+            self._toggle_block("📚 상세 내용", ""),   # empty shell for Phase 2
+        ]
+        page    = self._create_page(title, top_children)
+        page_id = page["id"]
+        url     = page.get("url", "<no url>")
+        logger.info("Page skeleton created: %s", url)
+
+        # Phase 2: append chunk detail to the 상세 내용 toggle
+        if result.chunk_summaries:
+            blocks = self._get_page_blocks(page_id)
+            # The 상세 내용 toggle is the third top-level block (index 2)
+            if len(blocks) >= 3:
+                detailed_block_id = blocks[2]["id"]
+                self._append_detailed_chunks(detailed_block_id, result.chunk_summaries)
+                logger.info(
+                    "Appended %d Part section(s) to '상세 내용'.",
+                    len(result.chunk_summaries),
+                )
+            else:
+                logger.warning(
+                    "Could not locate '상세 내용' toggle block — skipping Part append."
+                )
+
+        logger.info("Notion page ready: %s", url)
         return url
 
     # ------------------------------------------------------------------
-    # Internal: page creation
+    # Internal: page + block API calls
     # ------------------------------------------------------------------
 
     @retry(max_attempts=3, initial_delay=2.0, backoff=2.0, exceptions=(Exception,))
@@ -89,62 +119,91 @@ class NotionUploader:
         self._raise_for_status(resp)
         return resp.json()
 
+    @retry(max_attempts=3, initial_delay=2.0, backoff=2.0, exceptions=(Exception,))
+    def _get_page_blocks(self, page_id: str) -> list[dict]:
+        """Fetch the direct children of a page to obtain block IDs."""
+        resp = self._session.get(f"{NOTION_API_BASE}/blocks/{page_id}/children")
+        self._raise_for_status(resp)
+        return resp.json().get("results", [])
+
+    @retry(max_attempts=3, initial_delay=2.0, backoff=2.0, exceptions=(Exception,))
+    def _append_block_children(self, block_id: str, children: list[dict]) -> None:
+        resp = self._session.patch(
+            f"{NOTION_API_BASE}/blocks/{block_id}/children",
+            json={"children": children},
+        )
+        self._raise_for_status(resp)
+
+    def _append_detailed_chunks(
+        self, block_id: str, chunk_summaries: list[str]
+    ) -> None:
+        """
+        Append Part N heading + paragraph blocks for each chunk summary,
+        batching to respect MAX_BLOCKS_PER_BATCH.
+        """
+        for i, summary in enumerate(chunk_summaries, start=1):
+            part_blocks: list[dict] = []
+
+            # "Part N" heading
+            part_blocks.append({
+                "object": "block",
+                "type":   "heading_3",
+                "heading_3": {
+                    "rich_text": [self._text_element(f"Part {i}")],
+                },
+            })
+            # Summary paragraphs
+            part_blocks.extend(self._paragraphs_from_text(summary))
+
+            # Append in batches of MAX_BLOCKS_PER_BATCH
+            for start in range(0, len(part_blocks), MAX_BLOCKS_PER_BATCH):
+                batch = part_blocks[start: start + MAX_BLOCKS_PER_BATCH]
+                self._append_block_children(block_id, batch)
+
     # ------------------------------------------------------------------
     # Internal: block builders
     # ------------------------------------------------------------------
 
-    def _build_children(self, result: SummaryResult) -> list[dict]:
-        """
-        Build the top-level block list: three toggle blocks.
-        Each toggle's content is split into paragraph blocks respecting the
-        Notion 2 000-character limit.
-        """
-        return [
-            self._toggle_block("📝 전체 요약",  result.overall_summary),
-            self._toggle_block("📌 핵심 개념",  result.key_concepts),
-            self._toggle_block("📚 상세 내용",  result.detailed_notes),
-        ]
-
     def _toggle_block(self, heading: str, content: str) -> dict:
         """
-        Return a toggle block whose children are paragraph blocks.
-        The heading itself is limited to 2 000 chars (always safe here).
+        Return a toggle block.  Children are only embedded when content is
+        non-empty — the 상세 내용 toggle is intentionally left childless
+        so Phase 2 can append to it cleanly.
         """
-        children = self._paragraphs_from_text(content)
-        return {
+        block: dict[str, Any] = {
             "object": "block",
             "type":   "toggle",
             "toggle": {
                 "rich_text": [self._text_element(heading)],
-                "children":  children,
             },
         }
+        if content.strip():
+            block["toggle"]["children"] = self._paragraphs_from_text(content)
+        return block
 
     def _paragraphs_from_text(self, text: str) -> list[dict]:
         """
-        Convert *text* into a list of paragraph blocks, each under 1 800 chars.
-        Splitting happens at newline boundaries.
+        Convert *text* into paragraph blocks, each ≤ MAX_BLOCK_CHARS.
         """
         chunks = _split_at_newlines(text, MAX_BLOCK_CHARS)
         blocks: list[dict] = []
         for chunk in chunks:
             if not chunk.strip():
                 continue
-            # A single paragraph block can hold multiple rich_text elements;
-            # each element is ≤ 2 000 chars.  We further split to be safe.
-            rich_texts = [self._text_element(part) for part in _split_rich_text(chunk)]
+            rich_texts = [
+                self._text_element(part)
+                for part in _split_rich_text(chunk)
+            ]
             blocks.append({
-                "object": "block",
-                "type":   "paragraph",
+                "object":    "block",
+                "type":      "paragraph",
                 "paragraph": {"rich_text": rich_texts},
             })
-        return blocks or [
-            {
-                "object": "block",
-                "type":   "paragraph",
-                "paragraph": {"rich_text": [self._text_element("(내용 없음)")]},
-            }
-        ]
+        return blocks or [{
+            "object":    "block",
+            "type":      "paragraph",
+            "paragraph": {"rich_text": [self._text_element("(내용 없음)")]},
+        }]
 
     # ------------------------------------------------------------------
     # Internal: helpers
@@ -156,7 +215,7 @@ class NotionUploader:
 
     @staticmethod
     def _make_title(filename: str) -> str:
-        stem = filename.rsplit(".", 1)[0]  # strip extension
+        stem = filename.rsplit(".", 1)[0]
         date = datetime.date.today().isoformat()
         return f"{stem}  ({date})"
 
@@ -171,19 +230,14 @@ class NotionUploader:
 
 
 # ---------------------------------------------------------------------------
-# Text splitting utilities
+# Text splitting utilities (unchanged from v1)
 # ---------------------------------------------------------------------------
 
 def _split_at_newlines(text: str, max_chars: int) -> list[str]:
-    """
-    Split *text* into chunks of at most *max_chars* characters,
-    breaking only at newline characters.  If a single line exceeds
-    *max_chars* it is further split at word boundaries.
-    """
     if len(text) <= max_chars:
         return [text]
 
-    lines  = text.splitlines(keepends=True)
+    lines   = text.splitlines(keepends=True)
     chunks: list[str] = []
     current = ""
 
@@ -192,7 +246,6 @@ def _split_at_newlines(text: str, max_chars: int) -> list[str]:
             if current:
                 chunks.append(current)
                 current = ""
-            # If the line itself is too long, hard-split at words
             if len(line) > max_chars:
                 for part in _hard_split(line, max_chars):
                     chunks.append(part)
@@ -203,13 +256,11 @@ def _split_at_newlines(text: str, max_chars: int) -> list[str]:
 
     if current:
         chunks.append(current)
-
     return chunks
 
 
 def _hard_split(text: str, max_chars: int) -> list[str]:
-    """Split *text* at word boundaries when no newline exists."""
-    words  = text.split(" ")
+    words   = text.split(" ")
     chunks: list[str] = []
     current = ""
     for word in words:
@@ -226,8 +277,4 @@ def _hard_split(text: str, max_chars: int) -> list[str]:
 
 
 def _split_rich_text(text: str, max_chars: int = 2_000) -> list[str]:
-    """
-    Ensure each segment is ≤ *max_chars* for the Notion rich_text limit.
-    Uses _split_at_newlines for consistency.
-    """
     return _split_at_newlines(text, max_chars)
