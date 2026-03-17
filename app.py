@@ -44,7 +44,7 @@ if uploaded_file:
     if st.button("🚀 실행하기"):
         with st.spinner("처리 중... (몇 분 걸릴 수 있음)"):
             result = subprocess.run(
-                ["python", "main.py", "--audio-dir", "./audio"],
+                [sys.executable, "main.py", "--audio-dir", "./audio"],
                 capture_output=True,
                 text=True
             )
