@@ -1,33 +1,42 @@
 # Audio Lecture Summary Pipeline
 
-A production-ready pipeline that:
-1. Reads audio lecture files (AAC / M4A / WAV) from a folder
-2. Transcribes them with the **OpenAI Whisper API**
-3. Summarises the transcript in a **two-stage pipeline** optimised for exam preparation
-4. Uploads the results to **Notion** as a structured page per lecture
+Converts lecture audio → full transcript → exam-ready structured notes → Notion page.
+
+```
+Audio (.m4a / .aac / .wav)
+  │
+  ├─ ffmpeg         →  10-minute MP3 chunks
+  ├─ Whisper API    →  chunk transcripts  →  merged full transcript
+  ├─ GPT-4o         →  two-stage summarisation (chunk → synthesis)
+  └─ Notion API     →  structured lecture page
+```
+
+Supports **CLI**, **Google Colab**, and **Streamlit Cloud** (one-click web UI).
 
 ---
 
-## Folder Structure
+## Repository layout
 
 ```
 audio-summary/
-├── main.py               # Entry point & CLI
-├── audio_processor.py    # Audio loading, splitting, chunk export
-├── transcriber.py        # Whisper API transcription
-├── summarizer.py         # Two-stage GPT-4o summarization
-├── notion_uploader.py    # Notion API page creation
-├── utils.py              # Logging, retry, progress cache, helpers
-├── requirements.txt
-├── .env.example
+├── app.py                # Streamlit web UI entry point
+├── main.py               # CLI entry point
+├── audio_processor.py    # ffmpeg-based chunking (no pydub)
+├── transcriber.py        # Whisper API transcription + fuzzy dedup
+├── summarizer.py         # Two-stage GPT-4o summarisation
+├── notion_uploader.py    # Notion page creation
+├── utils.py              # logging, retry, ProgressStore, CostTracker
+├── requirements.txt      # Python dependencies
+├── packages.txt          # System packages for Streamlit Cloud (ffmpeg)
+├── .env.example          # Environment variable template
 └── README.md
 ```
 
 ---
 
-## Quick Start
+## Prerequisites
 
-### 1. Install system dependencies
+### System dependency: ffmpeg
 
 ```bash
 # Debian / Ubuntu / Google Colab
@@ -35,143 +44,231 @@ apt-get install -y ffmpeg
 
 # macOS
 brew install ffmpeg
+
+# Streamlit Cloud — handled automatically via packages.txt (already in repo)
 ```
 
-### 2. Install Python packages
-
-```bash
-pip install -r requirements.txt
-```
-
-### 3. Configure environment variables
-
-```bash
-cp .env.example .env
-# Edit .env and fill in your API keys
-```
-
-Required keys:
+### Environment variables
 
 | Variable | Description |
 |---|---|
 | `OPENAI_API_KEY` | [OpenAI API key](https://platform.openai.com/api-keys) |
 | `NOTION_TOKEN` | [Notion integration token](https://www.notion.so/my-integrations) |
-| `NOTION_PARENT_PAGE_ID` | 32-char hex ID of the Notion page that will contain lecture pages |
-
-### 4. Set up the Notion integration
-
-1. Go to https://www.notion.so/my-integrations and create a new integration.
-2. Copy the **Internal Integration Token** → `NOTION_TOKEN`.
-3. Open the Notion page that should be the parent for lecture pages.
-4. Click **...** → **Add connections** → select your integration.
-5. Copy the page ID from the URL (`notion.so/<workspace>/<PAGE_ID>`) → `NOTION_PARENT_PAGE_ID`.
+| `NOTION_PARENT_PAGE_ID` | 32-char hex ID of the Notion parent page |
 
 ---
 
-## Usage
+## Option A — CLI usage (local / server)
 
 ```bash
-# Process all audio files in a folder
+# 1. Install dependencies
+pip install -r requirements.txt
+
+# 2. Configure keys
+cp .env.example .env
+# Edit .env and fill in your API keys
+
+# 3. Run on a folder of audio files
 python main.py --audio-dir ./lectures
 
-# Process a single file
+# Run on a single file
 python main.py --audio-dir ./lectures --file lecture01.m4a
 
-# Skip Notion upload (test transcription & summarization only)
+# Skip Notion upload (transcription + summarisation only)
 python main.py --audio-dir ./lectures --skip-notion
 
-# Resume an interrupted run (cache is in .cache/ by default)
-python main.py --audio-dir ./lectures --cache-dir .cache
+# Custom output and cache directories
+python main.py --audio-dir ./lectures --output-dir ./outputs --cache-dir .cache
+```
+
+Output structure:
+
+```
+outputs/
+  transcripts/  <stem>_transcript.txt
+  summaries/    <stem>_overall.txt
+                <stem>_concepts.txt
+                <stem>_detailed.txt
+  logs/         costs.json
 ```
 
 ---
 
-## Google Colab Setup
+## Option B — Google Colab
 
 ```python
-# Cell 1 - system deps
+# Cell 1 — system deps
 !apt-get install -y ffmpeg
 
-# Cell 2 - Python deps
-!pip install openai pydub requests python-dotenv ffmpeg-python
+# Cell 2 — Python deps
+!pip install openai requests tiktoken streamlit python-dotenv
 
-# Cell 3 - clone / upload the pipeline files, then:
+# Cell 3 — clone repo (or upload files manually)
+!git clone https://github.com/<your-org>/audio-summary.git
+%cd audio-summary
+
+# Cell 4 — set API keys
 import os
-os.environ["OPENAI_API_KEY"]          = "sk-..."
-os.environ["NOTION_TOKEN"]            = "secret_..."
-os.environ["NOTION_PARENT_PAGE_ID"]   = "your-page-id"
+os.environ["OPENAI_API_KEY"]        = "sk-..."
+os.environ["NOTION_TOKEN"]          = "secret_..."
+os.environ["NOTION_PARENT_PAGE_ID"] = "your-page-id"
 
-# Cell 4 - run
+# Cell 5 — upload audio and run
+# Upload your .m4a files to /content/lectures/ via the Files panel, then:
 !python main.py --audio-dir /content/lectures --cache-dir /content/.cache
+
+# Cell 5 (alternative) — run directly from Python
+from pathlib import Path
+from main import run_pipeline
+run_pipeline(
+    audio_dir   = Path("/content/lectures"),
+    output_dir  = Path("/content/outputs"),
+    cache_dir   = Path("/content/.cache"),
+    skip_notion = False,
+    target_file = None,
+)
 ```
 
 ---
 
-## Notion Page Structure
+## Option C — Streamlit Cloud (one-click web UI)
 
-Each lecture produces one page with this layout:
+### Deploy
 
+1. Fork or push this repository to your GitHub account.
+2. Go to [share.streamlit.io](https://share.streamlit.io) → **New app**.
+3. Select your repository.  Set **Main file path** to `app.py`.
+4. Under **Settings → Secrets**, add:
+
+```toml
+OPENAI_API_KEY        = "sk-..."
+NOTION_TOKEN          = "secret_..."
+NOTION_PARENT_PAGE_ID = "your-32-char-hex-page-id"
 ```
-  <filename>  (YYYY-MM-DD)
-  |-- Full exam-oriented synthesis     (전체 요약)
-  |-- Key concepts + definitions       (핵심 개념)
-  |-- Logical flow + exam points       (상세 내용)
+
+5. Click **Deploy**.  `ffmpeg` is installed automatically via `packages.txt`.
+
+### Use
+
+- Open the deployed URL.
+- Upload a lecture audio file (`.m4a`, `.aac`, `.wav`, `.mp3`).
+- Click **▶ Run Pipeline**.
+- Download the transcript or summary, or view the Notion link.
+
+### Local Streamlit
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env   # fill in keys
+streamlit run app.py
 ```
 
 ---
 
-## Resume / Fault Tolerance
+## Notion page structure
 
-The pipeline caches intermediate results in `.cache/<filename>.json` after each step:
+Each lecture produces one child page:
+
+```
+<filename>  (YYYY-MM-DD)
+├─ 📝 전체 요약   — Full exam-oriented synthesis
+├─ 📌 핵심 개념   — Key concepts + important definitions
+└─ 📚 상세 내용   — Part 1 / Part 2 / … per transcript chunk
+```
+
+### Setting up the Notion integration
+
+1. Go to [notion.so/my-integrations](https://www.notion.so/my-integrations) and create an integration.
+2. Copy the **Internal Integration Token** → `NOTION_TOKEN`.
+3. Open the target Notion page → **…** → **Add connections** → select your integration.
+4. Copy the page ID from the URL (`notion.so/<workspace>/<PAGE_ID>`) → `NOTION_PARENT_PAGE_ID`.
+
+---
+
+## Chunking and long audio
+
+The pipeline handles files of any length:
+
+- Audio is split into **10-minute chunks** with a 30-second overlap using `ffmpeg`.
+- Each chunk is re-encoded as mono 16 kHz MP3 @ 32 kbps (≈ 2.4 MB / chunk).
+- This is well under Whisper's 25 MB per-file limit.
+- A 2-hour lecture → ~12 chunks → transcribed sequentially.
+- Overlapping sentences are removed via fuzzy similarity matching (SequenceMatcher).
+
+---
+
+## Resume / fault tolerance
+
+Intermediate results are cached in `.cache/<filename>.json` after each step:
 
 | Cache key | Content |
 |---|---|
-| `chunk_transcripts` | Per-chunk Whisper outputs |
+| `chunk_transcripts` | Per-chunk Whisper output |
 | `transcript` | Full merged transcript |
 | `chunk_summaries` | Per-chunk Stage-1 summaries |
 | `final_summary_raw` | Stage-2 synthesis |
-| `notion_page_url` | Notion page URL (prevents re-upload) |
+| `notion_page_url` | Prevents re-upload |
 | `status` | `done` or `failed` |
+| `audio_duration_seconds` | Used for cost calculation |
 
-Re-run the same command to resume from the last saved checkpoint.
+Re-run the same command to resume from the last checkpoint.  Already-completed
+files (status = `done`) are skipped automatically.  Use `--cache-dir` to point
+to the existing cache on a new machine.
 
 ---
 
-## Configuration Knobs
+## Cost tracking
 
-Set these in `.env` to tune behaviour without touching code:
+Costs are written to `outputs/logs/costs.json` after each file:
+
+```json
+{
+  "lecture01.m4a": {
+    "transcription": { "duration_minutes": 62.4, "cost_usd": 0.00374 },
+    "summarization": { "input_tokens": 18200, "output_tokens": 1540, "cost_usd": 0.061 },
+    "total_cost_usd": 0.0648,
+    "processed_at": "2025-03-17T14:22:01"
+  }
+}
+```
+
+Pricing used: Whisper $0.006/min · GPT-4o $2.50/1M input · $10.00/1M output.
+
+---
+
+## Configuration knobs
+
+Set these in `.env` or as environment variables:
 
 | Variable | Default | Description |
 |---|---|---|
-| `LOG_LEVEL` | `INFO` | `DEBUG` for verbose output |
-| `MAX_CHUNK_BYTES` | `20971520` (20 MB) | Max audio chunk size for Whisper |
-| `CHUNK_OVERLAP_MS` | `30000` (30 s) | Overlap between audio chunks |
+| `CHUNK_DURATION_S` | `600` | Audio chunk length in seconds (10 min) |
+| `CHUNK_OVERLAP_S` | `30` | Overlap between chunks in seconds |
+| `LOG_LEVEL` | `INFO` | `DEBUG` for verbose ffmpeg + API output |
 
 ---
 
 ## Architecture
 
 ```
-main.py
-  |
-  |-- audio_processor.py   pydub + ffmpeg  ->  list of WAV chunks
-  |
-  |-- transcriber.py       Whisper API     ->  full transcript
-  |
-  |-- summarizer.py
-  |     Stage 1: transcript chunks  ->  GPT-4o chunk summaries
-  |     Stage 2: chunk summaries    ->  SummaryResult (3 sections)
-  |
-  |-- notion_uploader.py   Notion API      ->  page URL
-  |
-  |-- utils.py             logging, @retry, ProgressStore, file helpers
+app.py / main.py
+  │
+  ├── audio_processor.py   ffmpeg subprocess  →  AudioChunk list
+  │     _probe_duration()  ffprobe            →  duration_seconds
+  │     _ffmpeg_extract()  ffmpeg             →  mono 16kHz 32kbps MP3
+  │
+  ├── transcriber.py       Whisper API        →  full transcript
+  │     split_points()     plan chunks (no I/O)
+  │     extract_chunk()    one ffmpeg call on demand
+  │     _merge()           fuzzy dedup at seams
+  │
+  ├── summarizer.py        GPT-4o             →  SummaryResult
+  │     Stage 1:  token-based chunks  →  chunk summaries (tiktoken)
+  │     Stage 2:  synthesis           →  4-section exam notes
+  │
+  ├── notion_uploader.py   Notion API         →  page URL
+  │     Phase 1:  create page skeleton
+  │     Phase 2:  append Part N sub-sections
+  │
+  └── utils.py             logging, @retry, ProgressStore, CostTracker
 ```
-
----
-
-## Error Handling
-
-- All API calls retry up to **3 times** with exponential backoff (2s -> 4s -> 8s).
-- On failure, intermediate results are saved to `.cache/` automatically.
-- The failed file is marked `status: failed`; other files continue processing.
-- Re-running the pipeline resumes from the last cached checkpoint.
