@@ -1,3 +1,4 @@
+<<<<<<< claude/audio-transcription-pipeline-rDxAi
 """
 app.py - Streamlit one-click web UI for the audio lecture pipeline.
 
@@ -363,3 +364,4 @@ except Exception as exc:
 finally:
     _detach_handler(log_handler)
     shutil.rmtree(tmp_dir, ignore_errors=True)
+

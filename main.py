@@ -36,14 +36,14 @@ import sys
 import traceback
 from pathlib import Path
 
-from dotenv import load_dotenv
+
 
 from notion_uploader import NotionUploader
 from summarizer import Summarizer
 from transcriber import Transcriber
 from utils import CostTracker, ProgressStore, discover_audio_files, ensure_dir, get_logger
 
-load_dotenv()
+
 logger = get_logger(__name__)
 
 
